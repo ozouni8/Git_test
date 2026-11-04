@@ -1,0 +1,82 @@
+"""いちばん小さい Agent。ここから書き換えて自分の Agent にする。
+
+ルールは 2 つだけ。
+  1. `Agent` という名前のクラスを作り、`BaseAgent` を継承する
+  2. `run(self, env, task, budget)` を持たせる
+
+`BaseAgent` を継承しておくと、`run` を書き忘れたときに GPU マシンへ繋ぐ前に
+エラーで教えてくれる。エディタの補完も効く。
+
+`env.step(code)` でロボットを動かすコードを送ると、GPU マシンで実行されて
+結果（stdout / stderr）が返ってくる。`env.render()` で今の画像（JPEG）が取れる。
+成功したかどうか（reward）は Agent からは見えない。実行が終わったあと、
+`trial.py` が表示する。
+
+LLM を呼んで起きた例外（タイムアウトなど）は捕まえずにそのまま投げる。`suite.py` は
+例外の種類で「LLM 側の障害」か「Agent の失敗」かを見分けて、前者ならやり直す。
+"""
+
+from capx.agent_api import AgentEnv, AgentResult, BaseAgent, Budget, TaskSpec
+from capx.llm.client import ModelQueryArgs, query_model #追加()
+from capx.agent_api.components.code_extract import extract_code #追加(LLMの出力からPythonコードを抜き出すライブラリ)
+import os #追加(.envなど環境変数にアクセスできるようにするライブラリ)
+from langfuse import get_client
+
+class Agent(BaseAgent):
+#初期化関数を追加(query_modelを使ってLLMを引っ張ってこれる)
+    def __init__(self, ctx=None) -> None:
+            # `--model` などは ctx に入ってくる。無ければ環境変数を使う
+            self.llm = ModelQueryArgs(
+                model=getattr(ctx, "model", "") or os.environ.get("OPENAI_BASE_MODEL", ""),
+                server_url=getattr(ctx, "server_url", None),
+                api_key=getattr(ctx, "api_key", None),
+                wire=getattr(ctx, "wire", None),
+                temperature=getattr(ctx, "temperature", None),
+                reasoning_effort=getattr(ctx, "reasoning_effort", None),
+            )
+            print(self.llm)
+
+
+    def run(self, env: AgentEnv, task: TaskSpec, budget: Budget) -> AgentResult:
+       # task.instruction … やること / task.api_docs … 使える関数の説明
+       #ここから
+        TASK=task.instruction
+        API=task.api_docs
+
+        prompt_system = get_client().get_prompt("ida/ida_system_prompt",type="text")
+        prompt_user = get_client().get_prompt("user_prompt", type="text")
+
+        system_prompt = prompt_system.compile()
+        user_prompt = prompt_user.compile(TASK=TASK,API=API)
+
+
+        messages = [
+            {"role": "system", "content":
+            system_prompt
+             },
+            {"role": "user", "content":
+            user_prompt 
+             }
+        ]
+        # LLMを呼び出す。
+        response = query_model(self.llm, messages)["content"]
+
+        codes = extract_code(response)
+        code = codes[0]
+        #ここまでを追加(LLMを呼び出してプロンプトを渡す(message)->出力をもらう(response))
+
+
+        goal = next(
+            (line for line in task.instruction.splitlines() if line.startswith("Goal")),
+            "",
+        )
+        print("やること:", goal)
+        result = env.step(code) #引数をcodeに変更
+        print("実行できた:", result.ok, "  出力:", repr(result.stdout))
+
+
+        image = env.render()
+        print("画像:", len(image), "bytes（JPEG）")
+
+
+        return AgentResult()
