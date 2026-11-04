@@ -80,3 +80,222 @@ class Agent(BaseAgent):
 
 
         return AgentResult()
+
+
+
+#//////////////////////////////////////////////////////////////
+
+
+
+"""タスクを段階に分け、観測結果を使って各段階を再試行する Agent。"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+from typing import Any
+
+from capx.agent_api import AgentEnv, AgentResult, BaseAgent, Budget, TaskSpec
+from capx.llm.client import ModelQueryArgs, query_model
+from langfuse import get_client
+
+
+class Agent(BaseAgent):
+    def __init__(self, ctx: Any = None) -> None:
+        self.llm = ModelQueryArgs(
+            model=getattr(ctx, "model", "") or os.environ.get("OPENAI_BASE_MODEL", ""),
+            server_url=getattr(ctx, "server_url", None),
+            api_key=getattr(ctx, "api_key", None),
+            wire=getattr(ctx, "wire", None),
+            temperature=getattr(ctx, "temperature", None),
+            reasoning_effort=getattr(ctx, "reasoning_effort", None),
+        )
+
+    @staticmethod
+    def _parse_json_response(content: Any) -> dict[str, Any]:
+        if not isinstance(content, str):
+            raise TypeError("LLM response content must be text")
+
+        text = content.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines[-1].strip() == "```":
+                text = "\n".join(lines[1:-1])
+
+        result = json.loads(text)
+        if not isinstance(result, dict):
+            raise ValueError("LLM response must be a JSON object")
+        return result
+
+    def _ask_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image: bytes,
+    ) -> dict[str, Any]:
+        image_url = "data:image/jpeg;base64," + base64.b64encode(image).decode("ascii")
+        response = query_model(
+            self.llm,
+            [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": system_prompt}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_url},
+                        },
+                    ],
+                },
+            ],
+        )
+        return self._parse_json_response(response["content"])
+
+    def run(self, env: AgentEnv, task: TaskSpec, budget: Budget) -> AgentResult:
+        if budget.max_steps <= 0:
+            return AgentResult(
+                notes={
+                    "planned_stages": [],
+                    "completed_stages": [],
+                    "steps_used": 0,
+                    "stop_reason": "step_budget_exhausted",
+                }
+            )
+
+        prompts = get_client()
+        system_prompt = prompts.get_prompt(
+            "ida/ida_system_prompt", type="text"
+        ).compile()
+        task_prompt = prompts.get_prompt("user_prompt", type="text").compile(
+            TASK=task.instruction,
+            API=task.api_docs,
+        )
+        protocol = (
+            "\n\nReturn only a valid JSON object matching the requested format. "
+            "Use only the robot API documented in the task prompt. "
+            "Do not use reward or claim success based on reward."
+        )
+        camera = task.cameras[0] if task.cameras else "main"
+        max_stages = max(1, min(5, budget.max_steps // 2))
+
+        plan = self._ask_json(
+            system_prompt + protocol,
+            task_prompt
+            + f"\n\nタスクを達成可能な順序付きの小さな段階に分けてください。"
+            f"段階数は最大 {max_stages} 個です。1段階のコードには複数のAPI呼び出しを"
+            "含めても構いません。再試行用のstep予算も残してください。各段階には、画像またはAPI出力で"
+            "確認できる達成条件を付けてください。JSON形式:"
+            '{"steps":[{"goal":"段階の目標","success_criteria":"達成条件"}]}',
+            env.render(camera),
+        )
+        raw_stages = plan.get("steps")
+        if not isinstance(raw_stages, list) or not raw_stages:
+            raise ValueError("LLM plan must contain a non-empty 'steps' list")
+        if len(raw_stages) > max_stages:
+            raise ValueError("LLM plan contains more stages than the stage limit")
+
+        stages: list[dict[str, str]] = []
+        for stage in raw_stages:
+            if not isinstance(stage, dict):
+                raise ValueError("Each planned stage must be a JSON object")
+            goal = stage.get("goal")
+            criteria = stage.get("success_criteria")
+            if not isinstance(goal, str) or not goal.strip():
+                raise ValueError("Each stage must have a non-empty goal")
+            if not isinstance(criteria, str) or not criteria.strip():
+                raise ValueError("Each stage must have non-empty success_criteria")
+            stages.append({"goal": goal, "success_criteria": criteria})
+
+        completed: list[dict[str, Any]] = []
+        steps_used = 0
+        stop_reason = "plan_completed"
+        decision_prompt = (
+            "\n\n現在の段階を画像と直前の実行結果から判定してください。"
+            "達成条件を満たした場合だけ complete とし、未達なら retry としてください。"
+            "retry の場合は、失敗したコードをそのまま繰り返さず、別の方法を検討して"
+            "短い自己完結したPythonコードを返してください。JSON形式:"
+            '{"status":"complete","reason":"判定理由"}'
+            ' または {"status":"retry","reason":"未達理由","code":"Pythonコード"}'
+        )
+
+        for index, stage in enumerate(stages):
+            attempts = 0
+            last_attempt: dict[str, Any] | None = None
+            stage_completed = False
+
+            while True:
+                decision = self._ask_json(
+                    system_prompt + protocol + decision_prompt,
+                    task_prompt
+                    + "\n現在の段階: "
+                    + json.dumps(stage, ensure_ascii=False)
+                    + "\n完了した段階: "
+                    + json.dumps(completed, ensure_ascii=False)
+                    + "\n直前の実行結果: "
+                    + json.dumps(last_attempt, ensure_ascii=False),
+                    env.render(camera),
+                )
+
+                status = decision.get("status")
+                reason = decision.get("reason", "")
+                if status == "complete":
+                    stage_completed = True
+                    completed.append(
+                        {
+                            "goal": stage["goal"],
+                            "attempts": attempts,
+                            "reason": reason,
+                        }
+                    )
+                    print(f"段階 {index + 1} 完了: {stage['goal']}")
+                    break
+                if status != "retry":
+                    raise ValueError("LLM decision status must be 'complete' or 'retry'")
+
+                if steps_used >= budget.max_steps:
+                    stop_reason = "step_budget_exhausted"
+                    break
+
+                code = decision.get("code")
+                if not isinstance(code, str) or not code.strip():
+                    raise ValueError("LLM retry decision must contain non-empty code")
+
+                result = env.step(code)
+                steps_used += 1
+                attempts += 1
+                last_attempt = {
+                    "ok": result.ok,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "truncated": result.truncated,
+                    "truncation_reason": result.truncation_reason,
+                }
+                print(
+                    f"段階 {index + 1} 試行 {attempts}:",
+                    "コード実行成功" if result.ok else "コード実行失敗",
+                    repr(result.stdout),
+                    repr(result.stderr),
+                )
+
+                if result.truncated:
+                    stop_reason = f"step_truncated:{result.truncation_reason}"
+                    break
+
+            if not stage_completed:
+                if stop_reason == "plan_completed":
+                    stop_reason = "stage_not_completed"
+                break
+
+        return AgentResult(
+            notes={
+                "planned_stages": stages,
+                "completed_stages": completed,
+                "steps_used": steps_used,
+                "stop_reason": stop_reason,
+            }
+        )
